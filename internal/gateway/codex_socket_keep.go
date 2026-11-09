@@ -205,29 +205,31 @@ func codexKeptCount() int {
 	return len(codexKeepPool)
 }
 
-// codexTurnShape is what of a turn the next one is compared with.
+// codexTurnShape is what of a turn the next one is compared with. It
+// holds the input's digests, not its items: it lives as long as the
+// turn's reply, and the items are the whole conversation, tens of MB on
+// a long one.
 type codexTurnShape struct {
 	fields map[string]string
-	input  []json.RawMessage
 	sums   []itemSum
 }
 
-// codexShape is body's shape, false for a body that is not continued
-// from: one whose input isn't a list of items, or that names a previous
-// response itself.
-func codexShape(body []byte) (*codexTurnShape, bool) {
+// codexShape is body's shape and its input's items, views of body for
+// delta, false for a body that is not continued from: one whose input
+// isn't a list of items, or that names a previous response itself.
+func codexShape(body []byte) (*codexTurnShape, []json.RawMessage, bool) {
 	var top map[string]json.RawMessage
-	if json.Unmarshal(body, &top) != nil {
-		return nil, false
+	if decodeJSONView(body, &top) != nil {
+		return nil, nil, false
 	}
 	if _, ok := top["previous_response_id"]; ok {
-		return nil, false
+		return nil, nil, false
 	}
 	var input []json.RawMessage
-	if json.Unmarshal(top["input"], &input) != nil {
-		return nil, false
+	if decodeJSONView(top["input"], &input) != nil {
+		return nil, nil, false
 	}
-	s := &codexTurnShape{fields: map[string]string{}, input: input, sums: make([]itemSum, len(input))}
+	s := &codexTurnShape{fields: map[string]string{}, sums: make([]itemSum, len(input))}
 	for k, v := range top {
 		switch k {
 		case "input", "client_metadata", "stream_options":
@@ -235,18 +237,18 @@ func codexShape(body []byte) (*codexTurnShape, bool) {
 		}
 		var b bytes.Buffer
 		if json.Compact(&b, v) != nil {
-			return nil, false
+			return nil, nil, false
 		}
 		s.fields[k] = b.String()
 	}
 	for i, it := range input {
 		sum, ok := codexSocketItem(it)
 		if !ok {
-			return nil, false
+			return nil, nil, false
 		}
 		s.sums[i] = sum
 	}
-	return s, true
+	return s, input, true
 }
 
 // codexSocketItem is an item's digest as the backend and Codex both have it:
@@ -296,8 +298,8 @@ func codexSocketItemBare(v any) any {
 }
 
 // delta is body as its new input after previous_response_id, when s
-// carries on from k's last turn.
-func (k *codexKept) delta(body []byte, s *codexTurnShape) ([]byte, bool) {
+// (with input, body's items) carries on from k's last turn.
+func (k *codexKept) delta(body []byte, s *codexTurnShape, input []json.RawMessage) ([]byte, bool) {
 	if k.replyID == "" || k.fields == nil || len(s.fields) != len(k.fields) {
 		return nil, false
 	}
@@ -325,7 +327,7 @@ func (k *codexKept) delta(body []byte, s *codexTurnShape) ([]byte, bool) {
 		return nil, false
 	}
 	rest := []byte{'['}
-	for i, it := range s.input[n:] {
+	for i, it := range input[n:] {
 		if i > 0 {
 			rest = append(rest, ',')
 		}

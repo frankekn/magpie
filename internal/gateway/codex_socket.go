@@ -173,30 +173,39 @@ func (t codexSocket) overSocket(req *http.Request, shun bool) (*http.Response, e
 	if !ok {
 		return viaHTTP()
 	}
-	msg := codexCreate(body)
 	var shape *codexTurnShape
+	var input []json.RawMessage
 	key := codexKeepKey(req, body)
 	if key != "" {
-		if s, ok := codexShape(body); ok {
-			shape = s
+		if s, in, ok := codexShape(body); ok {
+			shape, input = s, in
 		} else {
 			key = ""
 		}
 	}
+	// The turn's bytes are held until they are written, not while the
+	// backend thinks: a long conversation's turn is tens of MB, and its
+	// reply can take a minute to begin. A kept socket's turn goes as a
+	// delta, and should a new socket take it whole, it is read from req
+	// again.
 	if k := codexKeepTake(key); k != nil {
-		send := msg
-		if d, ok := k.delta(body, shape); ok {
-			send = codexCreate(d)
+		send := body
+		if d, ok := k.delta(body, shape, input); ok {
+			send = d
 		}
-		if codexMessageTooBig(req.URL.Host, len(send)) {
+		if msg := codexCreate(send); codexMessageTooBig(req.URL.Host, len(msg)) {
 			k.close()
 		} else {
-			res, err := t.turn(req, k, send, shape, true)
+			res, err := t.turn(req, k, msg, shape, true)
 			if !errors.Is(err, errCodexSocketAgain) {
 				return res, err
 			}
 		}
+		if body, ok = codexSocketMessage(req); !ok {
+			return t.next.RoundTrip(req)
+		}
 	}
+	msg := codexCreate(body)
 	if codexMessageTooBig(req.URL.Host, len(msg)) {
 		return viaHTTP()
 	}
@@ -390,11 +399,12 @@ func (t codexSocket) socket(req *http.Request, msg []byte, key string, shape *co
 // a kept socket (reused), whatever fails before the reply is handed on
 // is errCodexSocketAgain.
 func (t codexSocket) turn(req *http.Request, k *codexKept, msg []byte, shape *codexTurnShape, reused bool) (*http.Response, error) {
+	size := len(msg) // msg itself goes once written
 	ended := func(err error) error {
 		if req.Context().Err() != nil {
 			return req.Context().Err()
 		}
-		err = codexSocketEnded(k.host, len(msg), err)
+		err = codexSocketEnded(k.host, size, err)
 		if reused {
 			return errCodexSocketAgain
 		}
